@@ -1,16 +1,13 @@
 import 'dart:async';
+import 'dart:io';
 
-import 'package:desktop_webview_window/desktop_webview_window.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:flutter_web_auth_2_platform_interface/flutter_web_auth_2_platform_interface.dart';
-import 'package:path_provider/path_provider.dart';
 
-/// Implements the plugin interface using the Webview interface (currently used
-/// by Windows and Linux).
 class FlutterWebAuth2WebViewPlugin extends FlutterWebAuth2Platform {
-  bool _authenticated = false;
-  Webview? _webview;
+  _AuthInAppBrowser? _browser;
 
   @override
   Future<String> authenticate({
@@ -18,65 +15,122 @@ class FlutterWebAuth2WebViewPlugin extends FlutterWebAuth2Platform {
     required String callbackUrlScheme,
     required Map<String, dynamic> options,
   }) async {
-    if (!await WebviewWindow.isWebviewAvailable()) {
-      // Microsoft's WebView2 must be installed for this to work
-      throw StateError('Webview is not available');
-    }
-
     final parsedOptions = FlutterWebAuth2Options.fromJson(options);
 
-    // Reset
-    _authenticated = false;
-    _webview?.close();
+    await _browser?.close();
+    _browser = null;
 
-    final c = Completer<String>();
-    _webview = await WebviewWindow.create(
-      configuration: CreateConfiguration(
-        windowHeight: 720,
-        windowWidth: 1280,
-        title: 'Authenticate',
-        titleBarTopPadding: 0,
-        userDataFolderWindows: (await getTemporaryDirectory()).path,
+    final completer = Completer<String>();
+
+    _browser = _AuthInAppBrowser(
+      callbackUrlScheme: callbackUrlScheme,
+      options: parsedOptions,
+      onResult: (resultUrl) {
+        if (!completer.isCompleted) {
+          completer.complete(resultUrl);
+        }
+      },
+      onCancel: () {
+        if (!completer.isCompleted) {
+          completer.completeError(
+            PlatformException(
+              code: 'CANCELED',
+              message: 'User canceled',
+            ),
+          );
+        }
+      },
+    );
+
+    await _browser!.openUrlRequest(
+      urlRequest: URLRequest(
+        url: WebUri(url),
+      ),
+      settings: InAppBrowserClassSettings(
+        browserSettings: InAppBrowserSettings(
+          hideUrlBar: true,
+          hideToolbarTop: false,
+        ),
       ),
     );
-    _webview!.addOnUrlRequestCallback((url) {
-      final uri = Uri.parse(url);
-      if (uri.scheme != callbackUrlScheme ||
-          (parsedOptions.httpsHost != null &&
-              uri.host != parsedOptions.httpsHost) ||
-          (parsedOptions.httpsPath != null &&
-              uri.path != parsedOptions.httpsPath)) {
-        return;
-      }
-      _authenticated = true;
-      _webview?.close();
-      /**
-       * Not setting the webview to null will cause a crash if the
-       * application tries to open another webview
-       */
-      _webview = null;
-      c.complete(url);
-    });
-    unawaited(
-      _webview!.onClose.whenComplete(
-        () {
-          /**
-           * Not setting the webview to null will cause a crash if the
-           * application tries to open another webview
-           */
-          _webview = null;
-          if (!_authenticated) {
-            c.completeError(
-              PlatformException(code: 'CANCELED', message: 'User canceled'),
-            );
-          }
-        },
-      ),
-    );
-    _webview!.launch(url);
-    return c.future;
+
+    return completer.future;
   }
 
   @override
-  Future<void> clearAllDanglingCalls() async {}
+  Future<void> clearAllDanglingCalls() async {
+    await _browser?.close();
+    _browser = null;
+  }
+}
+
+class _AuthInAppBrowser extends InAppBrowser {
+  final String callbackUrlScheme;
+  final FlutterWebAuth2Options options;
+  final void Function(String url) onResult;
+  final VoidCallback onCancel;
+
+  bool _completed = false;
+
+  _AuthInAppBrowser({
+    required this.callbackUrlScheme,
+    required this.options,
+    required this.onResult,
+    required this.onCancel,
+  });
+
+  @override
+  Future<NavigationActionPolicy> shouldOverrideUrlLoading(
+    NavigationAction action,
+  ) async {
+    final uri = action.request.url;
+    if (uri == null) {
+      return NavigationActionPolicy.ALLOW;
+    }
+
+    final isCallback = uri.scheme == callbackUrlScheme &&
+        (options.httpsHost == null || uri.host == options.httpsHost) &&
+        (options.httpsPath == null || uri.path == options.httpsPath);
+
+    if (isCallback && !_completed) {
+      _completed = true;
+      onResult(uri.toString());
+      if (!Platform.isLinux) {
+        await close(); // not implemented for linux yet
+      }
+
+      return NavigationActionPolicy.CANCEL;
+    }
+
+    return NavigationActionPolicy.ALLOW;
+  }
+
+  @override
+  void onLoadStop(WebUri? url) {
+    // keep until shouldOverrideUrlLoading is not implemented for linux
+    super.onLoadStop(url);
+    if (url != null) {
+      final uri = Uri.parse(url.toString());
+      final isCallback = uri.scheme == callbackUrlScheme &&
+          (options.httpsHost == null || uri.host == options.httpsHost) &&
+          (options.httpsPath == null || uri.path == options.httpsPath);
+
+      if (isCallback && !_completed) {
+        _completed = true;
+        onResult(uri.toString());
+        if (!Platform.isLinux) {
+          close(); // not implemented for linux yet
+        }
+      }
+    }
+  }
+
+  @override
+  void onExit() {
+    if (!_completed) {
+      _completed = true;
+      onCancel();
+    }
+    super.onExit();
+  }
 }
