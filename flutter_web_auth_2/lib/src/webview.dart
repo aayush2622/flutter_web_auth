@@ -106,9 +106,8 @@ class _AuthInAppBrowser extends InAppBrowser {
   }
 
   @override
-  void onLoadStop(WebUri? url) {
-    // keep until shouldOverrideUrlLoading is not implemented for linux
-    super.onLoadStop(url);
+  void onUpdateVisitedHistory(WebUri? url, bool? isReload) {
+    super.onUpdateVisitedHistory(url, isReload);
     if (url != null) {
       final uri = Uri.parse(url.toString());
       final isCallback = uri.scheme == callbackUrlScheme &&
